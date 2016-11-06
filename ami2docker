@@ -1,0 +1,224 @@
+#!/usr/bin/env ruby
+require 'clamp'
+require 'base64'
+require 'aws-sdk'
+require 'colorize'
+
+require 'logger'
+Aws.config[:logger] = Logger.new $stdout
+
+# iam:ListRoles iam:CreateRole iam:AttachRolePolicy iam:CreateInstanceProfile iam:PassRole
+# ec2:RunInstance ec2:CreateVolume ec2:DescribeVolumes ec2:DescribeInstances ec2:AttachVolume
+# ssm:DescribeInstanceInformation ecr:CreateRepository ssm:SendCommand ssm:ListCommandInvocations s3:GetObject
+# ec2:DescribeImages s3:CreateBucket
+
+class CLI < Clamp::Command
+    option '--ami-name', 'AMI NAME', 'Name of AMI to turn into Docker image', required: true
+    option '--ssm-bucket', 'S3 BUCKET', 'Bucket for SSM output', required: true
+    option '--subnet-id', 'SUBNET ID', 'Subnet to launch temporary instance into'
+    option '--instance-profile', 'INSTANCE PROFILE', 'Name of instance profile'
+    option '--instance-type', 'INSTANCE TYPE', 'Instance type', default: 'm4.large'
+    option '--instance-ami-name', 'INSTANCE AMI NAME', 'AMI to use for temporary instance', default: 'amzn-ami-hvm-2016.03.3.x86_64-gp2'
+    option '--ecr-registry', 'ECR REGISTRY', 'Registry for Docker image to be uploaded to'
+
+    def get_instance_profile
+        iam = Aws::IAM::Client.new
+    
+        trust_doc = <<-JSON
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+        "Sid": "",
+        "Effect": "Allow",
+        "Principal": {
+            "Service": "ec2.amazonaws.com"
+        },
+        "Action": "sts:AssumeRole"
+        }
+    ]
+}
+        JSON
+
+        if instance_profile.nil?
+            role_name = 'ami2docker-instance-role'
+            instance_profile_name = 'ami2docker-instance-profile'
+
+            if iam.list_roles.roles.none? {|role| role.role_name == role_name }
+                role = iam.create_role role_name: role_name, assume_role_policy_document: trust_doc
+                iam.attach_role_policy role_name: role_name, policy_arn: 'arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM'
+                iam.attach_role_policy role_name: role_name, policy_arn: 'arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess'
+
+                iam.create_instance_profile instance_profile_name: instance_profile_name
+                iam.add_role_to_instance_profile instance_profile_name: instance_profile_name, role_name: role_name
+            end
+
+            return instance_profile_name
+        else
+            return instance_profile
+        end
+    end
+
+    def launch_instance(ami_id, instance_profile)
+        ec2 = Aws::EC2::Client.new
+
+        user_data = Base64.strict_encode64 <<-EOF
+#!/bin/bash
+cd /tmp
+curl https://amazon-ssm-#{ec2.config.region}.s3.amazonaws.com/latest/linux_amd64/amazon-ssm-agent.rpm -o amazon-ssm-agent.rpm
+yum install -y amazon-ssm-agent.rpm
+        EOF
+
+        args = {
+            image_id: ami_id,
+            min_count: 1,
+            max_count: 1,
+            user_data: user_data,
+            instance_type: instance_type,
+            iam_instance_profile: {
+                name: instance_profile
+            },
+            network_interfaces: [{
+                device_index: 0,
+                subnet_id: subnet_id,
+                associate_public_ip_address: true
+            }]
+        }.reject {|_, v| v.nil? }
+        
+        ec2.run_instances(args).instances.first
+    end
+
+    def create_and_attach_volume(instance)
+        ec2 = Aws::EC2::Client.new
+    
+        image = ami_for_name ami_name
+        snapshot_id = image.block_device_mappings[0].ebs.snapshot_id
+
+        az = 
+
+        create_vol = ec2.create_volume(
+            availability_zone: instance.placement.availability_zone,
+            snapshot_id: snapshot_id, 
+            size: 8, 
+            volume_type: 'gp2'
+        )
+        volume_id = create_vol.volume_id
+        loop do
+            sleep 5
+            vol_resp = ec2.describe_volumes filters: [{ name: 'volume-id', values: [volume_id] }]
+            inst_resp = ec2.describe_instances instance_ids: [instance.instance_id]
+            vol_state = vol_resp.volumes[0].state
+            inst_state = inst_resp.reservations[0].instances[0].state.name
+            break if vol_state != 'creating' && inst_state == 'running'
+        end
+        
+        ec2.attach_volume device: '/dev/sdf', instance_id: instance.instance_id, volume_id: volume_id
+    end
+
+    def wait_for_ssm(instance_id)
+        ssm = Aws::SSM::Client.new
+    
+        loop do
+            sleep 10
+            filter = [{ key: 'InstanceIds', value_set: [instance_id] }]
+            resp = ssm.describe_instance_information instance_information_filter_list: filter
+            info = resp.instance_information_list
+            break if info.length > 0 && info[0].ping_status == 'Online'
+        end
+    end
+
+    def get_docker_tag
+        ecr = Aws::ECR::Client.new
+        
+        if ecr_registry.nil?
+            repo_name = ami_name
+            ecr_resp = ecr.create_repository repository_name: repo_name
+            reg_id = ecr_resp.repository.registry_id
+            registry = "#{reg_id}.dkr.ecr.#{ecr.config.region}.amazonaws.com/#{repo_name}"
+        else
+            registry = ecr_registry
+        end
+
+        "#{registry}:latest"
+    end
+
+    def ssm_exec(instance_id, bucket, command)
+        ssm = Aws::SSM::Client.new
+
+        send_command = ssm.send_command(
+            instance_ids: [instance_id],
+            document_name: 'AWS-RunShellScript',
+            output_s3_bucket_name: bucket,
+            parameters: {
+                commands: command.split("\n")
+            }
+        )
+
+        command_id = send_command.command.command_id
+
+        s3_key_prefix = ''
+
+        loop do
+            sleep 10
+
+            invocation_resp = ssm.list_command_invocations(
+                command_id: command_id, 
+                instance_id: instance_id, 
+                details: true
+            )
+
+            wait_statuses = ['Pending', 'InProgress']
+            invocation = invocation_resp.command_invocations.first
+            if invocation && !wait_statuses.include?(invocation.status)
+                s3_key_prefix = invocation.command_plugins[0].output_s3_key_prefix
+                break
+            end
+        end
+
+        stdout_key = "#{s3_key_prefix}/0.aws:runShellScript/stdout"
+        stderr_key = "#{s3_key_prefix}/0.aws:runShellScript/stderr"
+
+        stdout = s3.get_object(bucket: bucket, key: stdout_key).body.read rescue ""
+        stderr = s3.get_object(bucket: bucket, key: stderr_key).body.read rescue ""
+        { stdout: stdout, stderr: stderr }
+    end
+
+    def ami_for_name(name)
+        ec2 = Aws::EC2::Client.new
+    
+        desc_images = ec2.describe_images filters: [{ name: 'name', values: [name] }]
+        desc_images.images.first
+    end
+
+    def execute
+        ec2 = Aws::EC2::Client.new
+
+        begin
+            instance_profile = get_instance_profile
+            instance_ami_id = ami_for_name(instance_ami_name).image_id 
+            instance = launch_instance instance_ami_id, instance_profile
+            create_and_attach_volume instance      
+            docker_tag = get_docker_tag
+            region = ec2.config.region
+
+            commands = <<-EOF
+                mount /dev/xvdf1 /mnt
+                yum -y install docker
+                service docker start
+                tar -c -C /mnt . | docker import --change 'CMD sh' - #{docker_tag}
+                eval "$(aws ecr --region #{region} get-login)"
+                docker push #{docker_tag}
+            EOF
+
+            wait_for_ssm instance.instance_id        
+            cmd_output = ssm_exec instance.instance_id, ssm_bucket, commands        
+
+            puts cmd_output[:stdout].colorize :green
+            puts cmd_output[:stderr].colorize :red
+        ensure
+            ec2.terminate_instances instance_ids: [instance.instance_id]
+        end
+    end
+end
+
+CLI.run
