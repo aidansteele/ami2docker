@@ -7,11 +7,6 @@ require 'colorize'
 require 'logger'
 Aws.config[:logger] = Logger.new $stdout
 
-# iam:ListRoles iam:CreateRole iam:AttachRolePolicy iam:CreateInstanceProfile iam:PassRole
-# ec2:RunInstance ec2:CreateVolume ec2:DescribeVolumes ec2:DescribeInstances ec2:AttachVolume
-# ssm:DescribeInstanceInformation ecr:CreateRepository ssm:SendCommand ssm:ListCommandInvocations s3:GetObject
-# ec2:DescribeImages s3:CreateBucket
-
 class CLI < Clamp::Command
     option '--ami-name', 'AMI NAME', 'Name of AMI to turn into Docker image', required: true
     option '--ssm-bucket', 'S3 BUCKET', 'Bucket for SSM output', required: true
